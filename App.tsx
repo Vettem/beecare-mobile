@@ -1,6 +1,5 @@
 // App.tsx
-import "react-native-gesture-handler";
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   View,
   Text,
@@ -10,26 +9,20 @@ import {
   ActivityIndicator,
   TouchableOpacity,
 } from "react-native";
-import { SafeAreaView, SafeAreaProvider } from "react-native-safe-area-context";
-import { colors, beePalette } from "./src/theme";
+import { SafeAreaView } from "react-native-safe-area-context";
 
-// Firebase
 import {
+  auth,
   db,
   collection,
   query,
   orderBy,
   onSnapshot,
-  auth,
+  limit,
 } from "./src/firebase";
-import { onAuthStateChanged, User, signOut } from "firebase/auth";
-
-// Pantalla de login/registro
+import { onAuthStateChanged, signOut } from "firebase/auth";
+import { colors } from "./src/theme";
 import AuthScreen from "./src/AuthScreen";
-
-// ============================
-// Tipos y helpers compartidos
-// ============================
 
 type AudioReport = {
   id: string;
@@ -41,9 +34,12 @@ type AudioReport = {
   createdAt?: any; // Firestore Timestamp u otro
 };
 
-// Por ahora seguimos usando colmena fija;
-// luego podemos mostrar un selector de colmenas
-const FIXED_HIVE_ID = "colmena1";
+type Hive = {
+  id: string;
+  name?: string;
+};
+
+type Mode = "summary" | "detail" | "account";
 
 // Traducción “bonita” para mostrar
 const PREDICTION_LABELS: Record<string, string> = {
@@ -88,99 +84,220 @@ function formatDateTime(date: Date | null): string {
   });
 }
 
-// ============================
-// App (Auth gate)
-// ============================
-
 export default function App() {
-  const [user, setUser] = useState<User | null>(null);
-  const [initializing, setInitializing] = useState(true);
+  const [authUser, setAuthUser] = useState<any | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
+  // Modo de pantalla
+  const [mode, setMode] = useState<Mode>("summary");
+
+  // Colmenas del usuario
+  const [hives, setHives] = useState<Hive[]>([]);
+  const [hivesLoading, setHivesLoading] = useState(false);
+  const [hivesRefreshing, setHivesRefreshing] = useState(false);
+
+  // Mapa hiveId -> último análisis (para la pantalla de resumen)
+  const [latestByHive, setLatestByHive] = useState<
+    Record<string, AudioReport | null>
+  >({});
+
+  // Colmena seleccionada para la vista detalle
+  const [selectedHiveId, setSelectedHiveId] = useState<string | null>(null);
+
+  // Audios de la colmena seleccionada
+  const [audios, setAudios] = useState<AudioReport[]>([]);
+  const [audiosLoading, setAudiosLoading] = useState(false);
+  const [audiosRefreshing, setAudiosRefreshing] = useState(false);
+
+  // ---------------------------
+  // 1) Escuchar estado de Auth
+  // ---------------------------
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (firebaseUser) => {
-      setUser(firebaseUser);
-      setInitializing(false);
+    const unsub = onAuthStateChanged(auth, (user) => {
+      setAuthUser(user);
+      setAuthLoading(false);
+      // Cada vez que cambia de usuario, volvemos a la vista resumen
+      setMode("summary");
+      setSelectedHiveId(null);
+      setAudios([]);
     });
 
     return () => unsub();
   }, []);
 
-  if (initializing) {
-    // Pantalla de carga mientras se resuelve el estado de Auth
-    return (
-      <SafeAreaProvider>
-        <SafeAreaView style={styles.safeArea}>
-          <StatusBar
-            barStyle="light-content"
-            backgroundColor={colors.background}
-          />
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" color={colors.primarySoft} />
-            <Text style={styles.loadingText}>Cargando BeeCare…</Text>
-          </View>
-        </SafeAreaView>
-      </SafeAreaProvider>
-    );
-  }
-
-  return (
-    <SafeAreaProvider>
-      {user ? <BeeCareHome user={user} /> : <AuthScreen />}
-    </SafeAreaProvider>
-  );
-}
-
-// ============================
-// Pantalla principal BeeCare
-// ============================
-
-function BeeCareHome({ user }: { user: User }) {
-  const [audios, setAudios] = useState<AudioReport[]>([]);
-
+  // ---------------------------
+  // 2) Suscribirse a las colmenas del usuario
+  // ---------------------------
   useEffect(() => {
-    // Referencia a users/<uid>/hives/<hive_id>/audios
+    if (!authUser) {
+      setHives([]);
+      setLatestByHive({});
+      return;
+    }
+
+    setHivesLoading(true);
+
+    const hivesRef = collection(db, "users", authUser.uid, "hives");
+    const qHives = query(hivesRef, orderBy("name", "asc"));
+
+    const unsub = onSnapshot(
+      qHives,
+      (snapshot) => {
+        const list: Hive[] = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...(doc.data() as any),
+        }));
+        setHives(list);
+        setHivesLoading(false);
+        setHivesRefreshing(false);
+      },
+      () => {
+        setHivesLoading(false);
+        setHivesRefreshing(false);
+      }
+    );
+
+    return () => unsub();
+  }, [authUser]);
+
+  // -------------------------------------------------------
+  // 3) Para cada colmena, escuchar SOLO el último análisis
+  //    (para mostrar en la pantalla de resumen)
+  // -------------------------------------------------------
+  useEffect(() => {
+    if (!authUser || hives.length === 0) {
+      setLatestByHive({});
+      return;
+    }
+
+    const unsubscribers: Array<() => void> = [];
+
+    hives.forEach((hive) => {
+      const audiosRef = collection(
+        db,
+        "users",
+        authUser.uid,
+        "hives",
+        hive.id,
+        "audios"
+      );
+      const qLatest = query(
+        audiosRef,
+        orderBy("createdAt", "desc"),
+        limit(1)
+      );
+
+      const unsub = onSnapshot(qLatest, (snapshot) => {
+        const latestDoc = snapshot.docs[0];
+        setLatestByHive((prev) => ({
+          ...prev,
+          [hive.id]: latestDoc
+            ? {
+                id: latestDoc.id,
+                ...(latestDoc.data() as any),
+              }
+            : null,
+        }));
+      });
+
+      unsubscribers.push(unsub);
+    });
+
+    return () => {
+      unsubscribers.forEach((u) => u());
+    };
+  }, [authUser, hives]);
+
+  // ---------------------------------------------
+  // 4) Audios de la colmena seleccionada (detalle)
+  // ---------------------------------------------
+  useEffect(() => {
+    if (!authUser || !selectedHiveId) {
+      setAudios([]);
+      return;
+    }
+
+    setAudiosLoading(true);
+
     const audiosRef = collection(
       db,
       "users",
-      user.uid,
+      authUser.uid,
       "hives",
-      FIXED_HIVE_ID,
+      selectedHiveId,
       "audios"
     );
 
-    const q = query(audiosRef, orderBy("createdAt", "desc"));
+    const qAudios = query(audiosRef, orderBy("createdAt", "desc"));
 
-    const unsub = onSnapshot(q, (snapshot) => {
-      const items: AudioReport[] = snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...(doc.data() as any),
-      }));
-      setAudios(items);
-    });
+    const unsub = onSnapshot(
+      qAudios,
+      (snapshot) => {
+        const items: AudioReport[] = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...(doc.data() as any),
+        }));
+        setAudios(items);
+        setAudiosLoading(false);
+        setAudiosRefreshing(false);
+      },
+      () => {
+        setAudiosLoading(false);
+        setAudiosRefreshing(false);
+      }
+    );
 
     return () => unsub();
-  }, [user.uid]);
+  }, [authUser, selectedHiveId]);
 
-  const latest = useMemo(
-    () => (audios.length > 0 ? audios[0] : null),
-    [audios]
+  // ---------------------------
+  // 5) Derivados para el detalle
+  // ---------------------------
+  const latestForSelected = useMemo(
+    () =>
+      selectedHiveId ? latestByHive[selectedHiveId] ?? null : null,
+    [latestByHive, selectedHiveId]
   );
 
-  const latestDate = timestampToDate(latest?.createdAt ?? null);
-  const latestPredictionKey = (latest?.prediction ?? "").toLowerCase();
+  const latestDate = timestampToDate(latestForSelected?.createdAt ?? null);
+  const latestPredictionKey = (latestForSelected?.prediction ?? "").toLowerCase();
   const latestLabel =
-    PREDICTION_LABELS[latestPredictionKey] ?? latest?.prediction ?? "—";
+    PREDICTION_LABELS[latestPredictionKey] ??
+    latestForSelected?.prediction ??
+    "—";
   const latestColor =
-    PREDICTION_COLORS[latestPredictionKey] ?? colors.textSubtle;
-  const latestProbPercent = latest
-    ? Math.round((latest.probability ?? 0) * 100)
+    PREDICTION_COLORS[latestPredictionKey] ?? colors.primarySoft;
+  const latestProbPercent = latestForSelected
+    ? Math.round((latestForSelected.probability ?? 0) * 100)
     : null;
 
-  const renderItem = ({ item }: { item: AudioReport }) => {
+  const selectedHive = selectedHiveId
+    ? hives.find((h) => h.id === selectedHiveId) ?? null
+    : null;
+
+  // ---------------------------
+  // Handlers de refresh
+  // ---------------------------
+  const handleRefreshHives = () => {
+    if (!authUser) return;
+    setHivesRefreshing(true);
+    setTimeout(() => setHivesRefreshing(false), 800);
+  };
+
+  const handleRefreshAudios = () => {
+    if (!authUser || !selectedHiveId) return;
+    setAudiosRefreshing(true);
+    setTimeout(() => setAudiosRefreshing(false), 800);
+  };
+
+  // ---------------------------
+  // Render de ítems de historial
+  // ---------------------------
+  const renderAudioItem = ({ item }: { item: AudioReport }) => {
     const date = timestampToDate(item.createdAt ?? null);
     const key = (item.prediction ?? "").toLowerCase();
     const label = PREDICTION_LABELS[key] ?? item.prediction ?? "—";
-    const color = PREDICTION_COLORS[key] ?? colors.textSubtle;
+    const color = PREDICTION_COLORS[key] ?? colors.primarySoft;
     const prob = Math.round((item.probability ?? 0) * 100);
 
     return (
@@ -206,49 +323,277 @@ function BeeCareHome({ user }: { user: User }) {
     );
   };
 
-  return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar
-        barStyle="light-content"
-        backgroundColor={colors.background}
-      />
-      <View style={styles.container}>
-        {/* Header superior con logout */}
-        <View style={styles.topRow}>
-          <View>
-            <Text style={styles.appTitle}>BeeCare</Text>
-            <Text style={styles.appSubtitle}>Monitoreo de colmenas</Text>
+  // ============================
+  //   Pantallas
+  // ============================
+
+  // Estado inicial: cargando auth
+  if (authLoading) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar barStyle="light-content" />
+        <View style={styles.centered}>
+          <ActivityIndicator color={colors.primary} />
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // No hay usuario -> pantalla de Auth
+  if (!authUser) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar barStyle="light-content" />
+        <AuthScreen />
+      </SafeAreaView>
+    );
+  }
+
+  // ---------------------------
+  // Pantalla de CUENTA
+  // ---------------------------
+  if (mode === "account") {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar barStyle="light-content" />
+        <View style={styles.container}>
+          {/* Header con volver */}
+          <View style={styles.headerRow}>
+            <TouchableOpacity
+              onPress={() => setMode("summary")}
+              style={{ marginRight: 12 }}
+            >
+              <Text style={styles.backText}>◀ Volver</Text>
+            </TouchableOpacity>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.appTitle}>BeeCare</Text>
+              <Text style={styles.appSubtitle}>Tu cuenta</Text>
+            </View>
           </View>
 
-          <TouchableOpacity onPress={() => signOut(auth)}>
-            <Text style={styles.logoutText}>Cerrar sesión</Text>
+          {/* Tarjeta cuenta */}
+          <View style={styles.accountCard}>
+            <Text style={styles.accountTitle}>Datos de tu cuenta</Text>
+
+            <View style={styles.accountRow}>
+              <Text style={styles.accountLabel}>Correo</Text>
+              <Text style={styles.accountValue}>
+                {authUser.email ?? "Sin correo"}
+              </Text>
+            </View>
+
+            <View style={styles.accountRow}>
+              <Text style={styles.accountLabel}>UID</Text>
+              <Text style={styles.accountValueMono}>{authUser.uid}</Text>
+            </View>
+
+            <View style={styles.accountInfoBox}>
+              <Text style={styles.accountInfoTitle}>
+                ¿Para qué sirve este UID?
+              </Text>
+              <Text style={styles.accountInfoText}>
+                Comparte este identificador cuando configures un dispositivo
+                BeeCare. Así, los audios de tus colmenas se enviarán
+                directamente a tu cuenta y aparecerán en esta app.
+              </Text>
+            </View>
+
+            <TouchableOpacity
+              style={styles.logoutButton}
+              onPress={() => signOut(auth)}
+            >
+              <Text style={styles.logoutButtonText}>Cerrar sesión</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // ---------------------------
+  // Pantalla de RESUMEN (todas las colmenas)
+  // ---------------------------
+  if (mode === "summary") {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar barStyle="light-content" />
+        <View style={styles.container}>
+          {/* Header */}
+          <View style={styles.headerRow}>
+            <View>
+              <Text style={styles.appTitle}>BeeCare</Text>
+              <Text style={styles.appSubtitle}>Monitoreo de colmenas</Text>
+            </View>
+            <TouchableOpacity onPress={() => setMode("account")}>
+              <Text style={styles.accountLinkText}>Cuenta</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Lista de colmenas */}
+          <Text style={styles.listTitle}>Tus colmenas</Text>
+
+          {hivesLoading ? (
+            <View style={styles.centered}>
+              <ActivityIndicator color={colors.primary} />
+            </View>
+          ) : hives.length === 0 ? (
+            <Text style={styles.emptyText}>
+              Aún no tienes colmenas registradas. Cuando se procese el primer
+              audio para este usuario, se creará una colmena automáticamente.
+            </Text>
+          ) : (
+            <FlatList
+              data={hives}
+              keyExtractor={(item) => item.id}
+              contentContainerStyle={{ paddingTop: 8, paddingBottom: 24 }}
+              refreshing={hivesRefreshing}
+              onRefresh={handleRefreshHives}
+              renderItem={({ item }) => {
+                const latest = latestByHive[item.id] ?? null;
+                const latestDate = timestampToDate(latest?.createdAt ?? null);
+                const key = (latest?.prediction ?? "").toLowerCase();
+                const label =
+                  latest &&
+                  (PREDICTION_LABELS[key] ?? latest.prediction ?? "—");
+                const color =
+                  latest &&
+                  (PREDICTION_COLORS[key] ?? colors.primarySoft);
+
+                return (
+                  <TouchableOpacity
+                    onPress={() => {
+                      setSelectedHiveId(item.id);
+                      setMode("detail");
+                    }}
+                    style={styles.hiveSummaryCard}
+                  >
+                    <View style={styles.hiveSummaryHeader}>
+                      <Text style={styles.hiveName}>
+                        {item.name ?? `Colmena ${item.id}`}
+                      </Text>
+                      <Text style={styles.hiveLastUpdate}>
+                        {latest ? timeAgo(latestDate) : "sin datos"}
+                      </Text>
+                    </View>
+
+                    {latest ? (
+                      <View style={styles.hiveStatusRow}>
+                        <View
+                          style={[
+                            styles.hiveStatusPill,
+                            { backgroundColor: color ?? colors.primarySoft },
+                          ]}
+                        >
+                          <Text style={styles.hiveStatusText}>{label}</Text>
+                        </View>
+                        <Text style={styles.hiveProbability}>
+                          {Math.round((latest.probability ?? 0) * 100)}%
+                          {" confianza"}
+                        </Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.summaryNoData}>
+                        Sin análisis aún. Cuando se procese el primer audio,
+                        verás el estado aquí.
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                );
+              }}
+            />
+          )}
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // ---------------------------
+  // Pantalla de DETALLE de colmena
+  // ---------------------------
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" />
+      <View style={styles.container}>
+        {/* Header con botón volver y acceso a cuenta */}
+        <View style={styles.headerRow}>
+          <View style={{ flexDirection: "row", alignItems: "center" }}>
+            <TouchableOpacity
+              onPress={() => {
+                setMode("summary");
+                setSelectedHiveId(null);
+              }}
+              style={{ marginRight: 12 }}
+            >
+              <Text style={styles.backText}>◀ Volver</Text>
+            </TouchableOpacity>
+            <View>
+              <Text style={styles.appTitle}>BeeCare</Text>
+              <Text style={styles.appSubtitle}>
+                Monitoreo de colmenas
+              </Text>
+            </View>
+          </View>
+
+          <TouchableOpacity onPress={() => setMode("account")}>
+            <Text style={styles.accountLinkText}>Cuenta</Text>
           </TouchableOpacity>
         </View>
 
-        {/* Tarjeta de resumen de la colmena */}
+        {/* Tarjeta de resumen de la colmena seleccionada */}
         <View style={styles.hiveCard}>
           <View style={styles.hiveHeaderRow}>
-            <Text style={styles.hiveName}>Colmena 1</Text>
-            <Text style={styles.hiveLastUpdate}>{timeAgo(latestDate)}</Text>
+            <Text style={styles.hiveName}>
+              {selectedHive?.name ?? `Colmena ${selectedHive?.id ?? ""}`}
+            </Text>
+            <Text style={styles.hiveLastUpdate}>
+              {latestForSelected ? timeAgo(latestDate) : "sin datos"}
+            </Text>
           </View>
 
           <Text style={styles.hiveStatusLabel}>Estado actual</Text>
-          <View style={styles.hiveStatusRow}>
-            <View
-              style={[styles.hiveStatusPill, { backgroundColor: latestColor }]}
-            >
-              <Text style={styles.hiveStatusText}>{latestLabel}</Text>
-            </View>
-            {latestProbPercent !== null && (
-              <Text style={styles.hiveProbability}>
-                {latestProbPercent}% confianza
-              </Text>
-            )}
-          </View>
 
-          <Text style={styles.hiveHint}>
-            Cada nuevo audio analizado actualizará este estado automáticamente.
-          </Text>
+          {latestForSelected ? (
+            <>
+              <View style={styles.hiveStatusRow}>
+                <View
+                  style={[
+                    styles.hiveStatusPill,
+                    { backgroundColor: latestColor },
+                  ]}
+                >
+                  <Text style={styles.hiveStatusText}>{latestLabel}</Text>
+                </View>
+                {latestProbPercent !== null && (
+                  <Text style={styles.hiveProbability}>
+                    {latestProbPercent}% confianza
+                  </Text>
+                )}
+              </View>
+
+              <Text style={styles.hiveHint}>
+                Cada nuevo audio analizado actualizará este estado
+                automáticamente.
+              </Text>
+            </>
+          ) : (
+            <>
+              <View style={styles.hiveStatusRow}>
+                <View
+                  style={[
+                    styles.hiveStatusPill,
+                    { backgroundColor: colors.primarySoft },
+                  ]}
+                >
+                  <Text style={styles.hiveStatusText}>Sin análisis aún</Text>
+                </View>
+              </View>
+              <Text style={styles.hiveHint}>
+                Aún no hay análisis para esta colmena. En cuanto se procese el
+                primer audio, verás el estado aquí.
+              </Text>
+            </>
+          )}
         </View>
 
         {/* Historial */}
@@ -257,22 +602,34 @@ function BeeCareHome({ user }: { user: User }) {
           <Text style={styles.listCount}>{audios.length} registros</Text>
         </View>
 
-        <FlatList
-          data={audios}
-          keyExtractor={(item) => item.id}
-          renderItem={renderItem}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-        />
+        {audiosLoading ? (
+          <View style={styles.centered}>
+            <ActivityIndicator color={colors.primary} />
+          </View>
+        ) : audios.length === 0 ? (
+          <Text style={styles.emptyText}>
+            Esta colmena aún no tiene análisis. Cuando se suba el primer
+            audio, verás los resultados aquí.
+          </Text>
+        ) : (
+          <FlatList
+            data={audios}
+            keyExtractor={(item) => item.id}
+            renderItem={renderAudioItem}
+            contentContainerStyle={styles.listContent}
+            showsVerticalScrollIndicator={false}
+            refreshing={audiosRefreshing}
+            onRefresh={handleRefreshAudios}
+          />
+        )}
       </View>
     </SafeAreaView>
   );
 }
 
-// ============================
-// Estilos
-// ============================
-
+// =====================
+//   ESTILOS
+// =====================
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
@@ -282,44 +639,42 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingHorizontal: 16,
     paddingTop: 12,
-    backgroundColor: colors.background,
   },
-  loadingContainer: {
+  centered: {
     flex: 1,
-    justifyContent: "center",
     alignItems: "center",
-    backgroundColor: colors.background,
+    justifyContent: "center",
   },
-  loadingText: {
-    marginTop: 12,
-    color: colors.textMain,
-  },
-  topRow: {
+  headerRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
     marginBottom: 16,
   },
-  logoutText: {
-    fontSize: 12,
-    color: beePalette.coral,
-    fontWeight: "600",
-  },
   appTitle: {
     fontSize: 26,
     fontWeight: "700",
-    color: colors.primaryText,
+    color: colors.textMain,
   },
   appSubtitle: {
     fontSize: 14,
     color: colors.textMuted,
-    marginBottom: 0,
   },
+  backText: {
+    fontSize: 14,
+    color: colors.primarySoft,
+  },
+  accountLinkText: {
+    fontSize: 14,
+    color: colors.primarySoft,
+    fontWeight: "600",
+  },
+
+  // Tarjeta de colmena detalle
   hiveCard: {
     backgroundColor: colors.cardElevated,
     borderRadius: 16,
     padding: 16,
-    marginTop: 16,
     marginBottom: 16,
     borderWidth: 1,
     borderColor: colors.cardBorder,
@@ -366,8 +721,20 @@ const styles = StyleSheet.create({
   },
   hiveHint: {
     fontSize: 12,
-    color: colors.textSubtle,
+    color: colors.textMuted,
     marginTop: 4,
+  },
+
+  // Lista / resumen de colmenas
+  listTitle: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: colors.textMain,
+    marginBottom: 8,
+  },
+  listCount: {
+    fontSize: 12,
+    color: colors.textSubtle,
   },
   listHeaderRow: {
     flexDirection: "row",
@@ -375,18 +742,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: 8,
   },
-  listTitle: {
-    fontSize: 16,
-    fontWeight: "600",
-    color: colors.textMain,
-  },
-  listCount: {
-    fontSize: 12,
-    color: colors.textSubtle,
-  },
   listContent: {
     paddingBottom: 24,
   },
+  emptyText: {
+    fontSize: 13,
+    color: colors.textMuted,
+    marginTop: 12,
+  },
+
+  // Tarjetas de historial
   card: {
     backgroundColor: colors.card,
     borderRadius: 14,
@@ -447,5 +812,88 @@ const styles = StyleSheet.create({
   cardSource: {
     fontSize: 11,
     color: colors.textSubtle,
+  },
+
+  // Tarjeta de resumen de colmena en la lista
+  hiveSummaryCard: {
+    backgroundColor: colors.cardElevated,
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: colors.cardBorder,
+  },
+  hiveSummaryHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 6,
+  },
+  summaryNoData: {
+    fontSize: 12,
+    color: colors.textMuted,
+    marginTop: 4,
+  },
+
+  // Account screen
+  accountCard: {
+    backgroundColor: colors.cardElevated,
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: colors.cardBorder,
+  },
+  accountTitle: {
+    fontSize: 18,
+    fontWeight: "600",
+    color: colors.textMain,
+    marginBottom: 16,
+  },
+  accountRow: {
+    marginBottom: 12,
+  },
+  accountLabel: {
+    fontSize: 12,
+    color: colors.textSubtle,
+    marginBottom: 2,
+  },
+  accountValue: {
+    fontSize: 14,
+    color: colors.textMain,
+  },
+  accountValueMono: {
+    fontSize: 13,
+    color: colors.textMain,
+    fontFamily: "monospace",
+  },
+  accountInfoBox: {
+    marginTop: 12,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: colors.backgroundSoft,
+    borderWidth: 1,
+    borderColor: colors.cardBorder,
+  },
+  accountInfoTitle: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: colors.textMain,
+    marginBottom: 4,
+  },
+  accountInfoText: {
+    fontSize: 12,
+    color: colors.textMuted,
+  },
+  logoutButton: {
+    marginTop: 20,
+    paddingVertical: 10,
+    borderRadius: 999,
+    backgroundColor: colors.danger,
+    alignItems: "center",
+  },
+  logoutButtonText: {
+    color: colors.primaryText,
+    fontSize: 14,
+    fontWeight: "600",
   },
 });
