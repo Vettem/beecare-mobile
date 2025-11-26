@@ -41,4 +41,3 @@ yarn-error.*
 /android
 
 # Configuración local de Firebase
-src/firebase.ts

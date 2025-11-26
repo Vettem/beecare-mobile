@@ -16,6 +16,8 @@
       "supportsTablet": true
     },
     "android": {
+      "package": "cl.beecare.app",
+      "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
@@ -25,6 +27,12 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "80206876-2014-40bd-9f2b-9bc3ae03f47a"
+      }
+    },
+    "owner": "vettem"
   }
 }
