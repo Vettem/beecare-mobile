@@ -8,6 +8,7 @@ import {
   StatusBar,
   ActivityIndicator,
   TouchableOpacity,
+  Modal,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -41,14 +42,20 @@ type Hive = {
 
 type Mode = "summary" | "detail" | "account";
 
-// Traducción “bonita” para mostrar
+// Traducción bonita para mostrar
 const PREDICTION_LABELS: Record<string, string> = {
+  con_reina: "Reina presente (colmena estable)",
+  sin_reina: "Reina ausente",
+  // Compatibilidad con modelos anteriores
   sana: "Colmena sana",
   reina_ausente: "Reina ausente",
 };
 
 // Colores por estado
 const PREDICTION_COLORS: Record<string, string> = {
+  con_reina: colors.healthy, // verde
+  sin_reina: colors.danger, // rojo
+  // Compatibilidad con modelos anteriores
   sana: colors.healthy,
   reina_ausente: colors.danger,
 };
@@ -108,6 +115,10 @@ export default function App() {
   const [audios, setAudios] = useState<AudioReport[]>([]);
   const [audiosLoading, setAudiosLoading] = useState(false);
   const [audiosRefreshing, setAudiosRefreshing] = useState(false);
+
+  // Detalle de un audio (modal)
+  const [selectedAudio, setSelectedAudio] = useState<AudioReport | null>(null);
+  const [showAudioDetail, setShowAudioDetail] = useState(false);
 
   // ---------------------------
   // 1) Escuchar estado de Auth
@@ -276,7 +287,7 @@ export default function App() {
     : null;
 
   // ---------------------------
-  // Handlers de refresh
+  // Handlers
   // ---------------------------
   const handleRefreshHives = () => {
     if (!authUser) return;
@@ -290,6 +301,11 @@ export default function App() {
     setTimeout(() => setAudiosRefreshing(false), 800);
   };
 
+  const handleAudioPress = (item: AudioReport) => {
+    setSelectedAudio(item);
+    setShowAudioDetail(true);
+  };
+
   // ---------------------------
   // Render de ítems de historial
   // ---------------------------
@@ -301,25 +317,27 @@ export default function App() {
     const prob = Math.round((item.probability ?? 0) * 100);
 
     return (
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <View style={styles.predictionRow}>
-            <View style={[styles.statusDot, { backgroundColor: color }]} />
-            <Text style={styles.predictionText}>{label}</Text>
+      <TouchableOpacity onPress={() => handleAudioPress(item)}>
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <View style={styles.predictionRow}>
+              <View style={[styles.statusDot, { backgroundColor: color }]} />
+              <Text style={styles.predictionText}>{label}</Text>
+            </View>
+            <Text style={styles.cardTime}>{timeAgo(date)}</Text>
           </View>
-          <Text style={styles.cardTime}>{timeAgo(date)}</Text>
-        </View>
 
-        <View style={styles.cardBody}>
-          <Text style={styles.cardLabel}>Probabilidad</Text>
-          <Text style={styles.cardValue}>{prob}%</Text>
-        </View>
+          <View style={styles.cardBody}>
+            <Text style={styles.cardLabel}>Probabilidad</Text>
+            <Text style={styles.cardValue}>{prob}%</Text>
+          </View>
 
-        <View style={styles.cardFooter}>
-          <Text style={styles.cardFooterText}>{formatDateTime(date)}</Text>
-          <Text style={styles.cardSource}>{item.source ?? "device_gcs"}</Text>
+          <View style={styles.cardFooter}>
+            <Text style={styles.cardFooterText}>{formatDateTime(date)}</Text>
+            <Text style={styles.cardSource}>{item.source ?? "device_gcs"}</Text>
+          </View>
         </View>
-      </View>
+      </TouchableOpacity>
     );
   };
 
@@ -511,6 +529,17 @@ export default function App() {
   // ---------------------------
   // Pantalla de DETALLE de colmena
   // ---------------------------
+  const modalDate = timestampToDate(selectedAudio?.createdAt ?? null);
+  const modalKey = (selectedAudio?.prediction ?? "").toLowerCase();
+  const modalLabel =
+    PREDICTION_LABELS[modalKey] ?? selectedAudio?.prediction ?? "—";
+  const modalColor =
+    PREDICTION_COLORS[modalKey] ?? colors.primarySoft;
+  const modalProb =
+    selectedAudio != null
+      ? Math.round((selectedAudio.probability ?? 0) * 100)
+      : null;
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="light-content" />
@@ -622,6 +651,65 @@ export default function App() {
             onRefresh={handleRefreshAudios}
           />
         )}
+
+        {/* Modal de detalle de audio */}
+        <Modal
+          visible={showAudioDetail && !!selectedAudio}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setShowAudioDetail(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalCard}>
+              <View style={styles.modalTitleRow}>
+                <View style={styles.predictionRow}>
+                  <View
+                    style={[
+                      styles.statusDot,
+                      { backgroundColor: modalColor },
+                    ]}
+                  />
+                  <Text style={styles.modalTitle}>{modalLabel}</Text>
+                </View>
+                <TouchableOpacity onPress={() => setShowAudioDetail(false)}>
+                  <Text style={styles.modalCloseText}>Cerrar</Text>
+                </TouchableOpacity>
+              </View>
+
+              <Text style={styles.modalSubtitle}>
+                Detalles del análisis
+              </Text>
+
+              <View style={styles.modalSection}>
+                <Text style={styles.modalLabel}>Probabilidad</Text>
+                <Text style={styles.modalValue}>
+                  {modalProb != null ? `${modalProb}%` : "—"}
+                </Text>
+              </View>
+
+              <View style={styles.modalSection}>
+                <Text style={styles.modalLabel}>Fecha y hora</Text>
+                <Text style={styles.modalValue}>
+                  {formatDateTime(modalDate)}
+                </Text>
+              </View>
+
+              <View style={styles.modalSection}>
+                <Text style={styles.modalLabel}>Origen</Text>
+                <Text style={styles.modalValue}>
+                  {selectedAudio?.source ?? "device_gcs"}
+                </Text>
+              </View>
+
+              <View style={styles.modalSection}>
+                <Text style={styles.modalLabel}>Ruta del audio</Text>
+                <Text style={styles.modalValueMono}>
+                  {selectedAudio?.audioPath ?? "—"}
+                </Text>
+              </View>
+            </View>
+          </View>
+        </Modal>
       </View>
     </SafeAreaView>
   );
@@ -895,5 +983,58 @@ const styles = StyleSheet.create({
     color: colors.primaryText,
     fontSize: 14,
     fontWeight: "600",
+  },
+
+  // Modal detalle de audio
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    justifyContent: "flex-end",
+  },
+  modalCard: {
+    backgroundColor: colors.cardElevated,
+    padding: 16,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    borderWidth: 1,
+    borderColor: colors.cardBorder,
+  },
+  modalTitleRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 4,
+  },
+  modalTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: colors.textMain,
+  },
+  modalSubtitle: {
+    fontSize: 12,
+    color: colors.textSubtle,
+    marginBottom: 8,
+  },
+  modalCloseText: {
+    fontSize: 13,
+    color: colors.primarySoft,
+    fontWeight: "600",
+  },
+  modalSection: {
+    marginTop: 8,
+  },
+  modalLabel: {
+    fontSize: 12,
+    color: colors.textSubtle,
+    marginBottom: 2,
+  },
+  modalValue: {
+    fontSize: 14,
+    color: colors.textMain,
+  },
+  modalValueMono: {
+    fontSize: 12,
+    color: colors.textMain,
+    fontFamily: "monospace",
   },
 });
