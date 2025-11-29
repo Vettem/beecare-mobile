@@ -204,9 +204,9 @@ export default function App() {
           ...prev,
           [hive.id]: latestDoc
             ? {
-                id: latestDoc.id,
-                ...(latestDoc.data() as any),
-              }
+              id: latestDoc.id,
+              ...(latestDoc.data() as any),
+            }
             : null,
         }));
       });
@@ -593,12 +593,13 @@ export default function App() {
                 >
                   <Text style={styles.hiveStatusText}>{latestLabel}</Text>
                 </View>
-                {latestProbPercent !== null && (
-                  <Text style={styles.hiveProbability}>
-                    {latestProbPercent}% confianza
-                  </Text>
-                )}
               </View>
+
+              {latestProbPercent !== null && (
+                <Text style={styles.hiveProbabilityBelow}>
+                  {latestProbPercent}% confianza
+                </Text>
+              )}
 
               <Text style={styles.hiveHint}>
                 Cada nuevo audio analizado actualizará este estado
@@ -790,7 +791,7 @@ const styles = StyleSheet.create({
   hiveStatusRow: {
     flexDirection: "row",
     alignItems: "center",
-    marginBottom: 8,
+    marginBottom: 4,
   },
   hiveStatusPill: {
     paddingHorizontal: 12,
@@ -806,6 +807,11 @@ const styles = StyleSheet.create({
     marginLeft: 8,
     fontSize: 13,
     color: colors.textMain,
+  },
+  hiveProbabilityBelow: {
+    fontSize: 13,
+    color: colors.textMain,
+    marginTop: 4,
   },
   hiveHint: {
     fontSize: 12,
